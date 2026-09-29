@@ -9,8 +9,19 @@ function numWithCommas(n){
 }
 
 export async function POST(req) {
+  // شبكة أمان: لو تجاوز التحليل 55 ثانية نرجّع رد JSON واضح بدل ما يقطعه Vercel
+  const timeoutResponse = new Promise(resolve =>
+    setTimeout(() => resolve(Response.json(
+      { error: "التحليل أخذ وقتاً أطول من المتوقع - حاول مرة أخرى" },
+      { status: 504 }
+    )), 55000)
+  );
+  return Promise.race([handleAnalyze(req), timeoutResponse]);
+}
+
+async function handleAnalyze(req) {
   try {
-    console.log("═══ ROUTE VERSION MARKER: HAMOOR-FIX-2026-09-20-V5 (Zai+OpenRouter+Tavily+fixed-Groq+fixed-Gemini) ═══");
+    console.log("═══ ROUTE VERSION MARKER: HAMOOR-FIX-2026-09-29-V6 (parallel-providers+no-audit) ═══");
     const { idea, sector: userSector, city, budget, extras } = await req.json();
     console.log("Request:", { idea, userSector, city, budget, extras });
 
@@ -250,36 +261,45 @@ ${adaptEngine}
   ]
 }`;
 
-    // ═══ دالة استدعاء Gemini (النموذج الأساسي) ═══
-    async function callGemini(userPrompt) {
-      // نستخدم alias "flash-latest" بدل رقم إصدار ثابت — جوجل تحدّثه تلقائيًا لأحدث نموذج Flash عندها،
-      // فما نحتاج نرجع نعدّل هذا السطر كل ما يطلعون إصدار جديد
-      const model = "gemini-flash-latest";
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    // ═══ مهلة كل مزوّد ذكاء اصطناعي (ثواني × 1000) ═══
+    const AI_TIMEOUT_MS = 38000;
+
+    // ═══ دالة مساعدة: إرسال طلب JSON مع مهلة وإمكانية الإلغاء ═══
+    async function postJSON(name, url, headers, body, ms, outerSignal) {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 40000);
-      let response;
+      const timer = setTimeout(() => ctrl.abort(), ms);
+      const onAbort = () => ctrl.abort();
+      if (outerSignal) {
+        if (outerSignal.aborted) ctrl.abort();
+        else outerSignal.addEventListener("abort", onAbort, { once: true });
+      }
       try {
-        response = await fetch(url, {
+        const response = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-            // thinkingBudget: 0 يعطّل "التفكير" الذي يستهلك من نفس حصة maxOutputTokens
-            // ويسبب انقطاع الـ JSON قبل اكتماله (وهذا كان سبب GEMINI_FAIL_PARSE)
-            generationConfig: { temperature: 0.4, maxOutputTokens: 8000, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } }
-          }),
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify(body),
           signal: ctrl.signal
         });
+        if (!response.ok) {
+          const errText = await response.text();
+          console.error(name + " Error:", response.status, errText.substring(0, 200));
+          throw new Error(name + "_FAIL_" + response.status);
+        }
+        return await response.json();
       } finally {
         clearTimeout(timer);
+        if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
       }
-      if (!response.ok) {
-        const errText = await response.text();
-        console.error("Gemini Error:", response.status, errText.substring(0, 200));
-        throw new Error("GEMINI_FAIL_" + response.status);
-      }
-      const data = await response.json();
+    }
+
+    // ═══ Gemini ═══
+    async function callGemini(userPrompt, signal) {
+      const model = "gemini-flash-latest";
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const data = await postJSON("GEMINI", url, {}, {
+        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 8000, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } }
+      }, AI_TIMEOUT_MS, signal);
       const cand = data.candidates?.[0];
       const text = cand?.content?.parts?.map(p => p.text || "").join("") || "";
       if (!text) throw new Error("GEMINI_FAIL_EMPTY");
@@ -291,180 +311,20 @@ ${adaptEngine}
       return parsed;
     }
 
-    // ═══ دالة استدعاء Z.ai (GLM) — نموذج مجاني بالكامل بشكل دائم من شركة Zhipu الصينية، مباشرة بدون وسيط ═══
-    // glm-4.5-flash مجاني 100% على التوكنز (مو تجربة محدودة بأيام)، تحتاج فقط إنشاء حساب على z.ai
-    async function callZai(userPrompt) {
-      const zaiKey = process.env.ZAI_API_KEY;
-      if (!zaiKey) throw new Error("ZAI_NO_KEY");
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 40000);
-      let response;
-      try {
-        response = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${zaiKey}` },
-          body: JSON.stringify({
-            model: "glm-4.5-flash",
-            messages: [{ role: "user", content: userPrompt }],
-            temperature: 0.35,
-            max_tokens: 6000,
-            response_format: { type: "json_object" }
-          }),
-          signal: ctrl.signal
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!response.ok) {
-        const errText = await response.text();
-        console.error("Z.ai Error:", response.status, errText.substring(0, 200));
-        throw new Error("ZAI_FAIL_" + response.status);
-      }
-      const data = await response.json();
+    // ═══ أي مزوّد بصيغة OpenAI (Cerebras / Groq / Z.ai) ═══
+    async function callChat(name, url, key, model, userPrompt, signal) {
+      if (!key) throw new Error(name + "_NO_KEY");
+      const data = await postJSON(name, url, { "Authorization": `Bearer ${key}` }, {
+        model,
+        messages: [{ role: "user", content: userPrompt }],
+        temperature: 0.35,
+        max_tokens: 8000,
+        response_format: { type: "json_object" }
+      }, AI_TIMEOUT_MS, signal);
       const text = data.choices?.[0]?.message?.content;
-      if (!text) throw new Error("ZAI_FAIL_EMPTY");
+      if (!text) throw new Error(name + "_FAIL_EMPTY");
       const parsed = extractJSON(text);
-      if (!parsed) throw new Error("ZAI_FAIL_PARSE");
-      return parsed;
-    }
-
-    // ═══ دالة استدعاء OpenRouter — عدة نماذج مجانية (صينية وغيرها) بالتتابع ═══
-    // مفتاح واحد (OPENROUTER_API_KEY) يعطي وصول لعشرات النماذج، وبعضها مجاني بالكامل.
-    // القائمة قد تتغيّر من طرف OpenRouter من وقت لآخر — راجع openrouter.ai/models?max_price=0
-    // وحدّث الأسماء أدناه لو أحد النماذج تقاعد أو تغيّر اسمه.
-    const OPENROUTER_FREE_MODELS = [
-      "deepseek/deepseek-chat-v3.1:free",
-      "z-ai/glm-4.5-air:free",
-      "qwen/qwen3-235b-a22b:free",
-      "moonshotai/kimi-k2:free",
-      "meta-llama/llama-3.3-70b-instruct:free"
-    ];
-
-    async function callOpenRouter(userPrompt) {
-      const orKey = process.env.OPENROUTER_API_KEY;
-      if (!orKey) throw new Error("OPENROUTER_NO_KEY");
-      let lastErr = null;
-      for (const model of OPENROUTER_FREE_MODELS) {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 40000);
-        try {
-          let response;
-          try {
-            response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${orKey}` },
-              body: JSON.stringify({
-                model,
-                messages: [{ role: "user", content: userPrompt }],
-                temperature: 0.35,
-                max_tokens: 6000,
-                response_format: { type: "json_object" }
-              }),
-              signal: ctrl.signal
-            });
-          } finally {
-            clearTimeout(timer);
-          }
-          if (!response.ok) {
-            const errText = await response.text();
-            console.error("OpenRouter Error (" + model + "):", response.status, errText.substring(0, 200));
-            lastErr = new Error("OPENROUTER_FAIL_" + response.status);
-            continue;
-          }
-          const data = await response.json();
-          const text = data.choices?.[0]?.message?.content;
-          if (!text) { lastErr = new Error("OPENROUTER_FAIL_EMPTY"); continue; }
-          const parsed = extractJSON(text);
-          if (!parsed) { lastErr = new Error("OPENROUTER_FAIL_PARSE"); continue; }
-          console.log("OpenRouter succeeded with model: " + model);
-          return parsed;
-        } catch (e) {
-          clearTimeout(timer);
-          console.error("OpenRouter exception (" + model + "):", e.message);
-          lastErr = e;
-          continue;
-        }
-      }
-      throw lastErr || new Error("OPENROUTER_ALL_FAILED");
-    }
-
-    // ═══ دالة استدعاء Groq (الاحتياطي) ═══
-    async function callGroq(userPrompt, attempt = 1) {
-      const groqKey = process.env.GROQ_API_KEY;
-      if (!groqKey) throw new Error("لا يوجد مفتاح احتياطي");
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 45000);
-      let response;
-      try {
-        response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${groqKey}` },
-          body: JSON.stringify({
-            model: "openai/gpt-oss-120b",
-            messages: [{ role: "user", content: userPrompt }],
-            temperature: 0.35,
-            max_tokens: 3200,
-            response_format: { type: "json_object" }
-          }),
-          signal: ctrl.signal
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!response.ok) {
-        const errText = await response.text();
-        console.error("Groq Error:", response.status, errText.substring(0, 300));
-        if (response.status === 429 && attempt < 3) {
-          await new Promise(r => setTimeout(r, 4000 * attempt));
-          return callGroq(userPrompt, attempt + 1);
-        }
-        throw new Error("GROQ_FAIL_" + response.status);
-      }
-      const data = await response.json();
-      const text = data.choices?.[0]?.message?.content;
-      if (!text) throw new Error("GROQ_FAIL_EMPTY");
-      const parsed = extractJSON(text);
-      if (!parsed) throw new Error("GROQ_FAIL_PARSE");
-      return parsed;
-    }
-
-    // ═══ دالة استدعاء Cerebras (الأسرع والأقوى - النموذج الأساسي الجديد) ═══
-    async function callCerebras(userPrompt, attempt = 1) {
-      const cerebrasKey = process.env.CEREBRAS_API_KEY;
-      if (!cerebrasKey) throw new Error("CEREBRAS_NO_KEY");
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      let response;
-      try {
-        response = await fetch("https://api.cerebras.ai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${cerebrasKey}` },
-          body: JSON.stringify({
-            model: "gpt-oss-120b",
-            messages: [{ role: "user", content: userPrompt }],
-            temperature: 0.35,
-            max_tokens: 6000,
-            response_format: { type: "json_object" }
-          }),
-          signal: ctrl.signal
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!response.ok) {
-        if (response.status === 429 && attempt < 2) {
-          await new Promise(r => setTimeout(r, 3000));
-          return callCerebras(userPrompt, attempt + 1);
-        }
-        const errText = await response.text();
-        console.error("Cerebras Error:", response.status, errText.substring(0, 200));
-        throw new Error("CEREBRAS_FAIL_" + response.status);
-      }
-      const data = await response.json();
-      const text = data.choices?.[0]?.message?.content;
-      if (!text) throw new Error("CEREBRAS_FAIL_EMPTY");
-      const parsed = extractJSON(text);
-      if (!parsed) throw new Error("CEREBRAS_FAIL_PARSE");
+      if (!parsed) throw new Error(name + "_FAIL_PARSE");
       return parsed;
     }
 
@@ -473,7 +333,7 @@ ${adaptEngine}
       const linkupKey = process.env.LINKUP_API_KEY;
       if (!linkupKey) return null;
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const timer = setTimeout(() => ctrl.abort(), 8000);
       try {
         const response = await fetch("https://api.linkup.so/v1/search", {
           method: "POST",
@@ -511,7 +371,7 @@ ${adaptEngine}
       const tavilyKey = process.env.TAVILY_API_KEY;
       if (!tavilyKey) return null;
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const timer = setTimeout(() => ctrl.abort(), 8000);
       try {
         const response = await fetch("https://api.tavily.com/search", {
           method: "POST",
@@ -574,37 +434,15 @@ ${adaptEngine}
       return deduped.slice(0, 6);
     }
 
-    // ═══ المرحلة 1: AI يولّد أسئلة بحث محددة للمشروع ═══
+    // ═══ المرحلة 1: أسئلة بحث جاهزة (بدون استدعاء ذكاء اصطناعي لتوفير الوقت) ═══
     async function generateResearchQueries(idea, sector, city, budget) {
-      const queryGenPrompt = `أنت محلل أعمال سعودي خبير. مشروع تجاري معروض عليك للتحليل:
-الفكرة: ${idea}
-القطاع: ${sector}
-المدينة: ${city}
-الميزانية: ${budget} ريال
-
-مهمتك: ولّد 4 أسئلة بحث محددة وذكية باللغة العربية للبحث عنها على الإنترنت لجمع معلومات حقيقية وحديثة عن هذا المشروع تحديداً. الأسئلة يجب أن تكون:
-- محددة جداً (ليس "تكاليف المطعم" بل "تكلفة تأسيس مطعم برجر صغير الرياض 2026")
-- متنوعة لتغطي: التكاليف، المنافسين الحقيقيين بالأسماء، حجم السوق والطلب، التراخيص المطلوبة
-- تستهدف مصادر سعودية حديثة (2025-2026)
-- مكتوبة كما يبحث الشخص في Google
-
-أرجع JSON فقط بهذا الشكل:
-{"queries": ["السؤال الأول", "السؤال الثاني", "السؤال الثالث", "السؤال الرابع"]}`;
-
-      try {
-        const result = await callAI(queryGenPrompt);
-        const queries = result.queries || [];
-        console.log("Generated " + queries.length + " research queries");
-        return queries.slice(0, 4);
-      } catch (e) {
-        console.log("Query generation failed, using fallback queries");
-        return [
-          `تكلفة تأسيس ${idea} ${city} 2026 ريال سعودي`,
-          `${sector} ${city} السعودية منافسين أسماء حقيقية`,
-          `${idea} السوق السعودي حجم الطلب 2026`,
-          `تراخيص ${sector} السعودية الشروط 2026`
-        ];
-      }
+      const shortIdea = String(idea).substring(0, 80);
+      return [
+        `تكلفة تأسيس ${shortIdea} ${city} 2026 ريال سعودي`,
+        `${sector} ${city} السعودية منافسين أسماء حقيقية`,
+        `${shortIdea} السوق السعودي حجم الطلب 2026`,
+        `تراخيص ${sector} السعودية الشروط 2026`
+      ];
     }
 
     // ═══ المرحلة 2: بحث عميق متوازي لكل سؤال ═══
@@ -652,42 +490,25 @@ ${adaptEngine}
       return { context, hasData: true, dataPoints: researchData.length };
     }
 
-    // ═══ استدعاء ذكي متعدد المزوّدين: Cerebras → Groq → Gemini ═══
-    let cerebrasBroken = false; // ذاكرة فشل خلال نفس الطلب
-
+    // ═══ استدعاء ذكي: نشغّل كل المزوّدين معاً ونأخذ أول رد صحيح، ونلغي الباقي ═══
     async function callAI(userPrompt) {
-      // 1) Cerebras أولاً - إلا لو فشل سابقاً في نفس الطلب
-      if (!cerebrasBroken) {
-        try {
-          return await callCerebras(userPrompt);
-        } catch (e1) {
-          console.log("Cerebras failed (" + e1.message + ")");
-          if (e1.message.includes("401") || e1.message.includes("402") || e1.message.includes("NO_KEY")) {
-            cerebrasBroken = true; // مفتاح خطأ أو رصيد منتهي، لا تكرر المحاولة بقية هذا الطلب
-            console.log("Cerebras unavailable (no credit/key), skipping for rest of request");
-          }
-        }
-      }
-      // 2) OpenRouter أولاً — فيها نماذج قوية فعلاً ومجانية بالكامل (ديب سيك الكامل، كوين 235B، كيمي K2) مو نسخ مصغّرة
+      const winner = new AbortController();
+      const attempts = [
+        callGemini(userPrompt, winner.signal),
+        callChat("CEREBRAS", "https://api.cerebras.ai/v1/chat/completions", process.env.CEREBRAS_API_KEY, "gpt-oss-120b", userPrompt, winner.signal),
+        callChat("GROQ", "https://api.groq.com/openai/v1/chat/completions", process.env.GROQ_API_KEY, "openai/gpt-oss-120b", userPrompt, winner.signal),
+        callChat("ZAI", "https://api.z.ai/api/paas/v4/chat/completions", process.env.ZAI_API_KEY, "glm-4.5-flash", userPrompt, winner.signal)
+      ];
       try {
-        return await callOpenRouter(userPrompt);
-      } catch (e2) {
-        console.log("OpenRouter failed (" + e2.message + "), trying Z.ai...");
+        const result = await Promise.any(attempts);
+        winner.abort();
+        return result;
+      } catch (e) {
+        winner.abort();
+        const errs = (e.errors || []).map(x => x.message).filter(m => !m.includes("NO_KEY"));
+        console.error("All providers failed:", errs.join(" | "));
+        throw new Error("ALL_PROVIDERS_FAILED: " + (errs[0] || e.message));
       }
-      // 3) Z.ai (GLM-Flash) — أخف وأسرع، احتياطي لو ازدحمت حصة OpenRouter
-      try {
-        return await callZai(userPrompt);
-      } catch (eZ) {
-        console.log("Z.ai failed (" + eZ.message + "), trying Groq...");
-      }
-      // 4) Groq
-      try {
-        return await callGroq(userPrompt);
-      } catch (e3) {
-        console.log("Groq failed (" + e3.message + "), switching to Gemini...");
-      }
-      // 5) Gemini كخيار أخير
-      return await callGemini(userPrompt);
     }
 
     console.log("═══ بدء التحليل بالبحث الحقيقي ═══");
@@ -717,55 +538,6 @@ ${adaptEngine}
 
     let merged = { ...coreData, ...planData };
 
-    // ═══ مرحلة التدقيق: مراجعة سريعة للأرقام مقابل البحث ═══
-    if (hasData) {
-      try {
-        const fa = merged.financial_analysis || {};
-        const auditPrompt = `أنت مدقق مالي صارم. راجع هذه الأرقام من دراسة جدوى لمشروع "${idea}" في ${city}:
-- إجمالي التأسيس: ${fa.setup_costs?.total || 0} ريال
-- التكاليف الشهرية: ${fa.monthly_costs?.total || 0} ريال
-- إيراد الشهر 12: ${fa.revenue_projection?.month_12 || 0} ريال
-- صافي ربح السنة الأولى: ${fa.annual_profit_year1 || 0} ريال
-- ميزانية صاحب المشروع: ${budgetNum} ريال
-
-ونتائج بحث حديثة عن السوق:
-${searchContext.substring(0, 3000)}
-
-مهمتك: قارن الأرقام مع البحث. إن وجدت رقماً بعيداً بوضوح عن واقع السوق (أعلى أو أدنى بأكثر من 50%)، صحّحه. أرجع JSON فقط:
-{"corrections_needed": <true|false>, "setup_total": <الرقم الصحيح أو نفسه>, "monthly_total": <الرقم>, "month_12_revenue": <الرقم>, "audit_note": "<جملة واحدة: ما الذي صححته ولماذا، أو 'الأرقام متسقة مع السوق'>"}`;
-        const audit = await callAI(auditPrompt);
-        if (audit && audit.corrections_needed) {
-          const fa2 = merged.financial_analysis || {};
-          if (audit.setup_total > 0 && fa2.setup_costs) {
-            const ratio = audit.setup_total / (fa2.setup_costs.total || audit.setup_total);
-            if (ratio > 0.3 && ratio < 3) { // حماية من تصحيحات جنونية
-              Object.keys(fa2.setup_costs).forEach(k => {
-                if (k !== "total" && typeof fa2.setup_costs[k] === "number") {
-                  fa2.setup_costs[k] = Math.round(fa2.setup_costs[k] * ratio);
-                }
-              });
-            }
-          }
-          if (audit.month_12_revenue > 0 && fa2.revenue_projection) {
-            const r12 = fa2.revenue_projection.month_12 || 0;
-            const ratio = r12 > 0 ? audit.month_12_revenue / r12 : 1;
-            if (ratio > 0.3 && ratio < 3) {
-              ["month_1","month_3","month_6","month_12"].forEach(k => {
-                if (typeof fa2.revenue_projection[k] === "number") {
-                  fa2.revenue_projection[k] = Math.round(fa2.revenue_projection[k] * ratio);
-                }
-              });
-            }
-          }
-          console.log("Audit pass: corrections applied - " + (audit.audit_note || ""));
-        } else {
-          console.log("Audit pass: numbers consistent with market");
-        }
-      } catch (e) {
-        console.log("Audit pass skipped (" + e.message + ")");
-      }
-    }
-
     merged._budget = budgetNum;
     merged._sector = sector;
     const validated = validateFinancials(merged);
@@ -788,6 +560,8 @@ ${searchContext.substring(0, 3000)}
       userMsg = "التحليل أخذ وقتاً أطول من المتوقع - حاول مرة أخرى";
     } else if (msg.includes("429") || msg.includes("rate")) {
       userMsg = "الخدمة مزدحمة الآن - حاول بعد دقيقة";
+    } else if (msg.includes("ALL_PROVIDERS_FAILED")) {
+      userMsg = "الخدمة مشغولة الآن - حاول مرة أخرى بعد لحظات";
     } else if (msg.includes("NO_KEY")) {
       userMsg = "إعدادات الخدمة غير مكتملة - اتصل بالدعم";
     }
