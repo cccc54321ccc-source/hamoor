@@ -41,6 +41,9 @@ const DARK = {
 
 let $ = LIGHT;
 
+// خط النظام: على أجهزة ابل يطلع خط ابل نفسه، وعلى غيرها الخط العادي للجهاز
+const APP_FONT = "-apple-system,BlinkMacSystemFont,system-ui,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif";
+
 const SH = {
   card:"0 1px 0 rgba(0,0,0,0.05),0 2px 12px rgba(0,0,0,0.05),0 4px 24px rgba(0,0,0,0.04)",
   lift:"0 2px 4px rgba(0,0,0,0.04),0 8px 24px rgba(0,0,0,0.08),0 16px 48px rgba(0,0,0,0.06)",
@@ -211,7 +214,7 @@ function MoneyRow({label, value, valueColor=$.L1, bold=false, big=false, note=nu
       <span style={{fontSize:13,color:$.L2}}>{label}</span>
       <span style={{fontSize:big?17:(bold?15:14),fontWeight:bold?800:600,color:valueColor,display:"inline-flex",alignItems:"center",gap:5,direction:"ltr"}}>
         <span>{fmt(value)}</span>
-        <span style={{fontFamily:"'Noto Sans Arabic',sans-serif",fontWeight:700}}>﷼</span>
+        <span style={{fontFamily:APP_FONT,fontWeight:700}}>﷼</span>
       </span>
     </div>
     {note && <div style={{fontSize:11,color:$.L4,marginTop:3,lineHeight:1.4}}>{note}</div>}
@@ -977,7 +980,7 @@ function LockedTabCard({title, onNeedUpgrade, screen}) {
 // المستشار — مرآة تعكس وضع العميل من بياناته هو، ويديرها هو بالكامل
 // ═══════════════════════════════════════════════════════════
 
-const numFont = {fontFamily:"'Inter','IBM Plex Sans Arabic',sans-serif", fontVariantNumeric:"tabular-nums"};
+const numFont = {fontFamily:APP_FONT, fontVariantNumeric:"tabular-nums"};
 const AD_SHADOW_SM = "0 1px 2px rgba(11,19,32,0.04), 0 6px 14px -6px rgba(11,19,32,0.08)";
 const AD_SHADOW = "0 1px 2px rgba(11,19,32,0.04), 0 14px 32px -14px rgba(11,19,32,0.12)";
 
@@ -4180,7 +4183,7 @@ export default function HamourApp() {
 
   if (!user) {
     return (
-      <div key={dark?"d":"l"}>
+      <div key={dark?"d":"l"} style={{fontFamily:APP_FONT}}>
         <style>{`@keyframes _spin{to{transform:rotate(360deg)}}*{-webkit-tap-highlight-color:transparent}body{margin:0}`}</style>
         <AuthScreen onSuccess={handleLogin}/>
       </div>
@@ -4188,7 +4191,7 @@ export default function HamourApp() {
   }
 
   return (
-    <div key={dark?"d":"l"} style={{minHeight:"100vh",background:$.bg,fontFamily:"'IBM Plex Sans Arabic',sans-serif",direction:"rtl"}}>
+    <div key={dark?"d":"l"} style={{minHeight:"100vh",background:$.bg,fontFamily:APP_FONT,direction:"rtl"}}>
       <style>{`
         @keyframes _spin{to{transform:rotate(360deg)}}
         @keyframes _float1{0%,100%{transform:translate(0,0);opacity:.25}50%{transform:translate(18px,-22px);opacity:.75}}
